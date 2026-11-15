@@ -1,17 +1,15 @@
-using System;
-using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
-using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 using CinemaAgent.Models;
 using Microsoft.Extensions.AI;
 using StackExchange.Redis;
+
+namespace CinemaAgent.Tools;
 
 public sealed class RedisCinemaTools
 {
@@ -19,38 +17,48 @@ public sealed class RedisCinemaTools
     private static readonly CultureInfo Polish = CultureInfo.GetCultureInfo("pl-PL");
     private static readonly StringComparer PolishOrder = StringComparer.Create(Polish, ignoreCase: true);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+
+    // Jedno, spójne nazewnictwo (camelCase, bez nulli) dla wszystkiego, co widzi model.
+    private static readonly JsonSerializerOptions ToolJson = new()
+    {
+        TypeInfoResolver = new DefaultJsonTypeInfoResolver(),
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
     private static readonly Regex RuntimePattern = new(
         @"^(?:(?<hours>[0-9]+)\s*h\s*)?(?:(?<minutes>[0-9]+)\s*min)?$",
         RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
     private const string SchedulePattern = "*:*:*:????-??-??";
     private const int BatchSize = 128;
+    private const int MaxPlacesPerFilm = 8;
 
     private readonly IDatabase database;
     private readonly IServer server;
-    private readonly int userAge;
-    private readonly bool enforceAgeRating;
     private readonly UserProfile user;
+    private readonly bool enforceAgeRating;
     private readonly Func<DateTimeOffset> utcNow;
 
     // Dla lokalnego, pojedynczego serwera Redis. Współdziel multiplexer między instancjami.
     public RedisCinemaTools(
         IConnectionMultiplexer redis,
-        int userAge,
+        UserProfile user,
         bool enforceAgeRating,
-        UserProfile userP,
         int databaseNumber = 0,
         Func<DateTimeOffset>? utcNow = null)
     {
         database = redis.GetDatabase(databaseNumber);
         server = redis.GetServer(redis.GetEndPoints().Single());
-        this.userAge = userAge;
-        user = userP;
+        this.user = user;
         this.enforceAgeRating = enforceAgeRating;
         this.utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
     }
 
     public IReadOnlyList<AIFunction> CreateAll() =>
-        new[] { nameof(FindCinemas), nameof(SearchMovies), nameof(GetScreenings), nameof(GetUserProfile) }
+        new[] { nameof(FindCinemas), nameof(GetScreenings), nameof(SearchMovies),
+                nameof(GetMovieDetails), nameof(GetMovieRatings), nameof(GetTicketUrl) }
             .Select(name => AIFunctionFactory.Create(
                 typeof(RedisCinemaTools).GetMethod(name)!, this,
                 new AIFunctionFactoryOptions
@@ -59,94 +67,121 @@ public sealed class RedisCinemaTools
                 }))
             .ToList();
 
-    [Description("Return the current user's profile.")]
-    public object? GetUserProfile() => user;
+    private static JsonElement Result(object value) =>
+        JsonSerializer.SerializeToElement(value, ToolJson);
+
+    // ───────────────────────── narzędzia ─────────────────────────
 
     [Description("Find cinemas with available repertory. All supplied filters must match. " +
-                 "Omit the filters to list all cinemas.")]
-    public async Task<object> FindCinemas(
-        [Description("City name or Kinowo slug, e.g. Warszawa, Łódź or trojmiasto")] string? city = null,
+                 "By default only the user's home city is searched; pass city='all' for every city.")]
+    public async Task<JsonElement> FindCinemas(
+        [Description("City name or Kinowo slug, e.g. Warszawa, Łódź or trojmiasto; 'all' = every city")] string? city = null,
         [Description("Cinema network, e.g. Multikino, Cinema City, Helios or inne")] string? network = null,
         [Description("Cinema name fragment, e.g. Złote Tarasy or Arkadia")] string? name = null,
         CancellationToken cancellationToken = default)
     {
-        var found = GetCinemaEntries(await ListSchedules(cancellationToken))
-            .Where(cinema => Matches(cinema.City, city) &&
+        var effectiveCity = EffectiveCity(city, specificTarget: !string.IsNullOrWhiteSpace(name));
+        var schedules = await ListSchedules(cancellationToken);
+        if (effectiveCity is not null && !schedules.Any(s => Matches(s.Cinema.City, effectiveCity)))
+            return CityNotFound(effectiveCity, schedules);
+
+        var found = GetCinemaEntries(schedules)
+            .Where(cinema => Matches(cinema.City, effectiveCity) &&
                 Matches(cinema.Network, network) && Matches(cinema.Name, name))
             .ToList();
-        return new
+
+        return Result(new
         {
+            city = effectiveCity ?? "all",
             total = found.Count,
             cinemas = found.Take(30).Select(cinema => new
             {
                 cinema.Id,
                 cinema.Name,
                 cinema.City,
-                cinema.Network,
-                Address = (string?)null
+                cinema.Network
             }).ToList()
-        };
+        });
     }
 
-    [Description("Search movies by title or genre and return their details, including ratings.")]
-    public async Task<object> SearchMovies(
+    [Description("Search movies by title or genre. Returns id, title, year, genres. Use get_movie_details for more. " +
+                 "Genres the user dislikes are hidden unless asked for explicitly.")]
+    public async Task<JsonElement> SearchMovies(
         [Description("Part of the title stored in Kinowo")] string? title = null,
         [Description("Genre, e.g. Horror, Komedia, Sci-Fi, Animacja")] string? genre = null,
+        [Description("Max results (1-30)")] int limit = 15,
         CancellationToken cancellationToken = default)
     {
+        var hidden = HiddenGenres(title, genre);
         var keys = new HashSet<string>(StringComparer.Ordinal);
         await foreach (var key in server.KeysAsync(database.Database, "movie:*").WithCancellation(cancellationToken))
             keys.Add(key.ToString());
 
         var movies = await ReadDocuments<MovieDocument>(keys, cancellationToken);
-        return movies
-            .Where(pair => MatchesMovie(pair.Value, title, genre) && IsAllowed(pair.Value.AgeRating))
+        var matching = movies
+            .Where(pair => MatchesMovie(pair.Value, title, genre) &&
+                !IsHidden(pair.Value, hidden) && IsAllowed(pair.Value.AgeRating))
             .OrderBy(pair => pair.Value.Title, PolishOrder)
             .ThenBy(pair => pair.Key, StringComparer.Ordinal)
-            .Select(pair => new
+            .ToList();
+
+        return Result(new
+        {
+            total = matching.Count,
+            hiddenGenres = hidden.Length > 0 ? hidden : null,
+            movies = matching.Take(Math.Clamp(limit, 1, 30)).Select(pair => new
             {
                 Id = pair.Key["movie:".Length..],
                 pair.Value.Title,
                 pair.Value.Year,
-                DurationMinutes = ParseDuration(pair.Value.Duration),
-                pair.Value.Genres,
-                pair.Value.AgeRating,
-                Description = (string?)null,
-                pair.Value.Ratings,
-                pair.Value.Director,
-                pair.Value.Cast,
-                pair.Value.Countries
-            }).ToList();
+                pair.Value.Genres
+            }).ToList()
+        });
     }
 
-    [Description("List upcoming screenings in chronological order, using Polish local dates and times. " +
-                 "Use it for the nearest film in a cinema, a genre at a certain time or when a film plays. " +
-                 "If only dateFrom is given, search that day.")]
-    public async Task<object> GetScreenings(
-        [Description("Cinema name fragment, e.g. Złote Tarasy or Cinema City Arkadia")] string? cinema = null,
+    [Description("List upcoming screenings grouped by film, films with the nearest screening first. " +
+                 "Each film lists cinemas, dates and times. Use for what is playing, the nearest film or a film's times. " +
+                 "By default searches the user's home city and hides genres the user dislikes. " +
+                 "If only dateFrom is given, search that day. limit = number of films.")]
+    public async Task<JsonElement> GetScreenings(
+        [Description("Cinema name fragment, e.g. Cinema City Arkadia")] string? cinema = null,
         [Description("Movie title fragment")] string? title = null,
         [Description("Genre, e.g. Horror")] string? genre = null,
         [Description("Date yyyy-MM-dd")] string? dateFrom = null,
         [Description("Date yyyy-MM-dd inclusive; defaults to dateFrom")] string? dateTo = null,
         [Description("Earliest local start HH:mm; evening = 17:00")] string? timeFrom = null,
         [Description("Latest local start HH:mm inclusive")] string? timeTo = null,
-        [Description("Max results (1-20)")] int limit = 10,
-        [Description("City name or its Kinowo slug, e.g. Warszawa, Łódź or trojmiasto")] string? city = null,
+        [Description("Max films per page (1-30)")] int limit = 20,
+        [Description("Number of films to skip, for the next page")] int offset = 0,
+        [Description("City name or Kinowo slug, e.g. Warszawa, trojmiasto. Defaults to the user's home city; 'all' = every city")] string? city = null,
         CancellationToken cancellationToken = default)
     {
-        var startDate = ParseDate(dateFrom, nameof(dateFrom));
-        var endDate = ParseDate(dateTo, nameof(dateTo)) ?? startDate;
-        var startTime = ParseTime(timeFrom, nameof(timeFrom));
-        var endTime = ParseTime(timeTo, nameof(timeTo));
+        var startDate = ParseDate(dateFrom);
+        var parsedEnd = ParseDate(dateTo);
+        var endDate = parsedEnd ?? startDate;
+        var startTime = ParseTime(timeFrom);
+        var endTime = ParseTime(timeTo);
+
+        if ((!string.IsNullOrWhiteSpace(dateFrom) && startDate is null) ||
+            (!string.IsNullOrWhiteSpace(dateTo) && parsedEnd is null))
+            return Result(new { error = "Dates must be yyyy-MM-dd." });
+        if ((!string.IsNullOrWhiteSpace(timeFrom) && startTime is null) ||
+            (!string.IsNullOrWhiteSpace(timeTo) && endTime is null))
+            return Result(new { error = "Times must be HH:mm." });
         if (startDate > endDate)
-            throw new ArgumentException("dateTo must be on or after dateFrom.");
+            return Result(new { error = "dateTo must be on or after dateFrom." });
         if (startTime > endTime)
-            throw new ArgumentException("timeTo must be at or after timeFrom.");
+            return Result(new { error = "timeTo must be at or after timeFrom." });
 
         var now = TimeZoneInfo.ConvertTime(utcNow(), Warsaw);
         var today = DateOnly.FromDateTime(now.DateTime);
-        var schedules = (await ListSchedules(cancellationToken))
-            .Where(schedule => Matches(schedule.Cinema.City, city)).ToList();
+
+        var effectiveCity = EffectiveCity(city, specificTarget: !string.IsNullOrWhiteSpace(cinema));
+        var allSchedules = await ListSchedules(cancellationToken);
+        var schedules = allSchedules.Where(schedule => Matches(schedule.Cinema.City, effectiveCity)).ToList();
+        if (effectiveCity is not null && schedules.Count == 0)
+            return CityNotFound(effectiveCity, allSchedules);
+
         var cinemas = FindCinemaEntries(schedules, cinema);
         if (!string.IsNullOrWhiteSpace(cinema) && cinemas.Count == 0)
             return CinemaNotFound(cinema, schedules);
@@ -165,7 +200,7 @@ public sealed class RedisCinemaTools
             var schedule = selected[key];
             foreach (var screening in screenings)
             {
-                if (string.IsNullOrWhiteSpace(screening.MovieId) ||
+                if (screening is null || string.IsNullOrWhiteSpace(screening.MovieId) ||
                     !TimeOnly.TryParseExact(screening.Time, "HH:mm", CultureInfo.InvariantCulture,
                         DateTimeStyles.None, out var localTime) ||
                     (startTime is not null && localTime < startTime) ||
@@ -178,6 +213,7 @@ public sealed class RedisCinemaTools
             }
         }
 
+        var hidden = HiddenGenres(title, genre);
         var movieKeys = candidates.Select(candidate => $"movie:{candidate.Screening.MovieId}")
             .Distinct(StringComparer.Ordinal);
         var movies = await ReadDocuments<MovieDocument>(movieKeys, cancellationToken);
@@ -185,35 +221,277 @@ public sealed class RedisCinemaTools
             .Select(candidate => (Candidate: candidate,
                 Movie: movies.GetValueOrDefault($"movie:{candidate.Screening.MovieId}")))
             .Where(item => item.Movie is not null && IsAllowed(item.Movie.AgeRating) &&
-                MatchesMovie(item.Movie, title, genre))
+                MatchesMovie(item.Movie, title, genre) && !IsHidden(item.Movie, hidden))
             .OrderBy(item => item.Candidate.StartsAt)
             .ThenBy(item => item.Candidate.Schedule.Cinema.Id, StringComparer.Ordinal)
             .ThenBy(item => item.Candidate.Screening.MovieId, StringComparer.Ordinal)
             .ToList();
 
-        return new
+        // GroupBy zachowuje kolejność pierwszego wystąpienia, więc filmy idą wg najbliższego seansu.
+        // Jeden film = jedna pozycja, niezależnie od liczby kin i dni.
+        var films = matching
+            .GroupBy(item => item.Candidate.Screening.MovieId, StringComparer.Ordinal)
+            .ToList();
+
+        var take = Math.Clamp(limit, 1, 30);
+        var skip = Math.Max(offset, 0);
+        var page = films.Skip(skip).Take(take).ToList();
+        var hasMore = skip + page.Count < films.Count;
+
+        var notes = new List<string>
         {
-            total = matching.Count,
-            note = matching.Count == 0
+            films.Count == 0
                 ? "No upcoming screenings match these filters."
-                : "Sorted chronologically; first item is the nearest.",
-            screenings = matching.Take(Math.Clamp(limit, 1, 20)).Select(item => new
-            {
-                item.Candidate.Screening.MovieId,
-                item.Movie!.Title,
-                item.Movie.AgeRating,
-                item.Movie.Genres,
-                Cinema = item.Candidate.Schedule.Cinema.Name,
-                item.Candidate.Schedule.Cinema.City,
-                item.Candidate.Schedule.Cinema.Network,
-                Date = item.Candidate.Schedule.Day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-                item.Candidate.Screening.Time,
-                item.Candidate.StartsAt,
-                item.Candidate.Screening.Room,
-                item.Candidate.Screening.Format,
-                item.Candidate.Screening.TicketUrl
-            }).ToList()
+                : hasMore
+                    ? $"Showing {page.Count} of {films.Count} films. Call again with offset={skip + page.Count} for the rest, " +
+                      "or tell the user there are more."
+                    : "All matching films are listed. Sorted by nearest screening."
         };
+        if (hidden.Length > 0)
+            notes.Add($"Hidden by the user's profile (disliked genres): {string.Join(", ", hidden)}. " +
+                      "They are shown only when the user asks for that genre or a specific title.");
+        if (effectiveCity is not null)
+            notes.Add($"Only city '{effectiveCity}' was searched; use city='all' to search everywhere.");
+
+        return Result(new
+        {
+            city = effectiveCity ?? "all",
+            totalFilms = films.Count,
+            totalScreenings = matching.Count,
+            shown = page.Count,
+            note = string.Join(" ", notes),
+            films = page.Select(group =>
+            {
+                var first = group.First();
+                var places = group
+                    .GroupBy(item => (item.Candidate.Schedule.Cinema.Id, item.Candidate.Schedule.Day))
+                    .ToList();
+                return new
+                {
+                    Id = group.Key,
+                    first.Movie!.Title,
+                    Age = first.Movie.AgeRating,
+                    first.Movie.Genres,
+                    Minutes = ParseDuration(first.Movie.Duration),
+                    Showings = places.Take(MaxPlacesPerFilm).Select(place => new
+                    {
+                        Cinema = place.First().Candidate.Schedule.Cinema.Name,
+                        Date = place.Key.Day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                        Times = place.Select(item => item.Candidate.Screening.Format is { Length: > 0 } format
+                            ? $"{item.Candidate.Screening.Time} {format}"
+                            : item.Candidate.Screening.Time).ToList()
+                    }).ToList(),
+                    MoreShowings = places.Count > MaxPlacesPerFilm ? places.Count - MaxPlacesPerFilm : (int?)null
+                };
+            }).ToList()
+        });
+    }
+
+    [Description("Get details of one movie: genres, director, cast, countries, length, age rating. " +
+                 "Pass movieId from get_screenings, or a title fragment.")]
+    public async Task<JsonElement> GetMovieDetails(
+        [Description("Movie id from get_screenings")] string? movieId = null,
+        [Description("Title fragment, used if movieId is unknown")] string? title = null,
+        CancellationToken cancellationToken = default)
+    {
+        var found = await ResolveMovies(movieId, title, cancellationToken);
+        if (MovieLookupProblem(found) is { } problem)
+            return problem;
+
+        var (id, movie) = found[0];
+        return Result(new
+        {
+            Id = id,
+            movie.Title,
+            movie.Year,
+            Minutes = ParseDuration(movie.Duration),
+            movie.AgeRating,
+            movie.Genres,
+            movie.Director,
+            movie.Cast,
+            movie.Countries
+        });
+    }
+
+    [Description("Get ratings (IMDb, Filmweb, Rotten Tomatoes, Metacritic) of one movie. " +
+                 "Pass movieId from get_screenings, or a title fragment.")]
+    public async Task<JsonElement> GetMovieRatings(
+        [Description("Movie id from get_screenings")] string? movieId = null,
+        [Description("Title fragment, used if movieId is unknown")] string? title = null,
+        CancellationToken cancellationToken = default)
+    {
+        var found = await ResolveMovies(movieId, title, cancellationToken);
+        if (MovieLookupProblem(found) is { } problem)
+            return problem;
+
+        var (id, movie) = found[0];
+        var ratings = new Dictionary<string, string>();
+        foreach (var (source, value) in movie.Ratings ?? new())
+        {
+            if (value.ValueKind != JsonValueKind.Object ||
+                !value.TryGetProperty("score", out var score) || score.ValueKind != JsonValueKind.Number)
+                continue;
+
+            var scale = value.TryGetProperty("scale", out var s) && s.ValueKind == JsonValueKind.Number
+                ? s.GetInt32() : 0;
+            var unit = value.TryGetProperty("unit", out var u) && u.ValueKind == JsonValueKind.String
+                ? u.GetString() : null;
+
+            ratings[source] = unit == "%"
+                ? $"{score.GetDouble().ToString(CultureInfo.InvariantCulture)}%"
+                : $"{score.GetDouble().ToString(CultureInfo.InvariantCulture)}/{scale}";
+        }
+
+        return Result(new
+        {
+            Id = id,
+            movie.Title,
+            Ratings = ratings,
+            note = ratings.Count == 0 ? "No ratings available for this movie." : null
+        });
+    }
+
+    [Description("Get the ticket purchase URL for one specific screening. " +
+                 "Call get_screenings first, then pass the cinema, title, date and time from its result.")]
+    public async Task<JsonElement> GetTicketUrl(
+        [Description("Cinema name, e.g. Cinema City Bemowo")] string cinema,
+        [Description("Movie title fragment")] string title,
+        [Description("Date yyyy-MM-dd")] string date,
+        [Description("Start time HH:mm")] string time,
+        CancellationToken cancellationToken = default)
+    {
+        var day = ParseDate(date);
+        var start = ParseTime(time);
+        if (day is null || start is null)
+            return Result(new { error = "date must be yyyy-MM-dd and time must be HH:mm." });
+
+        var schedules = (await ListSchedules(cancellationToken))
+            .Where(schedule => schedule.Day == day).ToList();
+        var cinemaIds = FindCinemaEntries(schedules, cinema)
+            .Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
+        var selected = schedules
+            .Where(schedule => cinemaIds.Contains(schedule.Cinema.Id))
+            .ToDictionary(schedule => schedule.Key);
+        if (selected.Count == 0)
+            return Result(new { error = $"No schedule for '{cinema}' on {date}." });
+
+        var documents = await ReadDocuments<ScreeningDocument[]>(selected.Keys, cancellationToken);
+        var candidates = documents
+            .SelectMany(pair => pair.Value
+                .Where(screening => screening is not null &&
+                    !string.IsNullOrWhiteSpace(screening.MovieId) &&
+                    TimeOnly.TryParseExact(screening.Time, "HH:mm", CultureInfo.InvariantCulture,
+                        DateTimeStyles.None, out var local) && local == start)
+                .Select(screening => (Schedule: selected[pair.Key], Screening: screening)))
+            .ToList();
+
+        var movieKeys = candidates.Select(c => $"movie:{c.Screening.MovieId}").Distinct(StringComparer.Ordinal);
+        var movies = await ReadDocuments<MovieDocument>(movieKeys, cancellationToken);
+
+        var matches = candidates
+            .Select(c => (c.Schedule, c.Screening, Movie: movies.GetValueOrDefault($"movie:{c.Screening.MovieId}")))
+            .Where(item => item.Movie is not null &&
+                IsAllowed(item.Movie.AgeRating) && MatchesMovie(item.Movie, title, null))
+            .ToList();
+
+        if (matches.Count == 0)
+            return Result(new { error = "No matching screening. Check cinema, title, date and time with get_screenings." });
+
+        return Result(new
+        {
+            total = matches.Count,
+            screenings = matches.Take(5).Select(item => new
+            {
+                item.Movie!.Title,
+                Cinema = item.Schedule.Cinema.Name,
+                Date = date,
+                Time = time,
+                item.Screening.Room,
+                item.Screening.Format,
+                item.Screening.TicketUrl
+            }).ToList()
+        });
+    }
+
+    // ───────────────────────── profil ─────────────────────────
+
+    /// <summary>
+    /// Miasto użyte w zapytaniu: jawne, albo z profilu. Domyślne miasto nie obowiązuje, gdy użytkownik
+    /// wskazał konkretne kino. "all" / "wszystkie" wyłącza filtr.
+    /// </summary>
+    private string? EffectiveCity(string? requested, bool specificTarget)
+    {
+        if (!string.IsNullOrWhiteSpace(requested))
+        {
+            var value = requested.Trim();
+            return value.Equals("all", StringComparison.OrdinalIgnoreCase) ||
+                   value.Equals("wszystkie", StringComparison.OrdinalIgnoreCase)
+                ? null : value;
+        }
+        return specificTarget || string.IsNullOrWhiteSpace(user.City) ? null : user.City;
+    }
+
+    /// <summary>Niechciane gatunki ukrywamy, chyba że użytkownik prosi o konkretny tytuł lub o ten gatunek.</summary>
+    private string[] HiddenGenres(string? title, string? genre)
+    {
+        if (!string.IsNullOrWhiteSpace(title) || user.DislikedGenres.Length == 0)
+            return [];
+
+        return user.DislikedGenres
+            .Where(disliked => string.IsNullOrWhiteSpace(genre) ||
+                !(Matches(disliked, genre) || Matches(genre, disliked)))
+            .ToArray();
+    }
+
+    private static bool IsHidden(MovieDocument movie, string[] hidden) =>
+        hidden.Length > 0 &&
+        (movie.Genres?.Any(g => hidden.Any(h => Matches(g, h))) ?? false);
+
+    // ───────────────────────── helpers ─────────────────────────
+
+    private async Task<List<(string Id, MovieDocument Movie)>> ResolveMovies(
+        string? movieId, string? title, CancellationToken cancellationToken)
+    {
+        var found = new List<(string Id, MovieDocument Movie)>();
+
+        if (!string.IsNullOrWhiteSpace(movieId))
+        {
+            var id = movieId.Trim();
+            if (id.StartsWith("movie:", StringComparison.Ordinal))
+                id = id["movie:".Length..];
+            var documents = await ReadDocuments<MovieDocument>(new[] { $"movie:{id}" }, cancellationToken);
+            if (documents.TryGetValue($"movie:{id}", out var movie) && IsAllowed(movie.AgeRating))
+                found.Add((id, movie));
+            return found;
+        }
+
+        if (string.IsNullOrWhiteSpace(title))
+            return found;
+
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var key in server.KeysAsync(database.Database, "movie:*").WithCancellation(cancellationToken))
+            keys.Add(key.ToString());
+
+        var movies = await ReadDocuments<MovieDocument>(keys, cancellationToken);
+        return movies
+            .Where(pair => MatchesMovie(pair.Value, title, null) && IsAllowed(pair.Value.AgeRating))
+            .OrderBy(pair => pair.Value.Title, PolishOrder)
+            .Take(5)
+            .Select(pair => (pair.Key["movie:".Length..], pair.Value))
+            .ToList();
+    }
+
+    private static JsonElement? MovieLookupProblem(List<(string Id, MovieDocument Movie)> found)
+    {
+        if (found.Count == 0)
+            return Result(new { error = "No such movie (or not allowed for this user). Check id or title with get_screenings or search_movies." });
+        if (found.Count > 1)
+            return Result(new
+            {
+                note = "Several movies match. Ask the user which one, or call again with movieId.",
+                matches = found.Select(item => new { item.Id, item.Movie.Title, item.Movie.Year }).ToList()
+            });
+        return null;
     }
 
     private async Task<List<ScheduleKey>> ListSchedules(CancellationToken cancellationToken)
@@ -271,15 +549,23 @@ public sealed class RedisCinemaTools
                 Matches(cinema.City, query) || Matches(cinema.Network, query))
             .ToList();
 
-    private static object CinemaNotFound(string query, IEnumerable<ScheduleKey> schedules)
-    {
-        return new
+    private static JsonElement CinemaNotFound(string query, IEnumerable<ScheduleKey> schedules) =>
+        Result(new
         {
             total = 0,
             note = $"No cinema matches '{query}'. Tell the user politely and offer available cinemas.",
             availableCinemas = GetCinemaEntries(schedules).Take(30).Select(cinema => cinema.Name).ToList()
-        };
-    }
+        });
+
+    private static JsonElement CityNotFound(string city, IEnumerable<ScheduleKey> schedules) =>
+        Result(new
+        {
+            total = 0,
+            note = $"No repertory data for city '{city}'. Tell the user politely and offer a city from availableCities, " +
+                   "or retry with city='all' if the user agrees to search elsewhere.",
+            availableCities = schedules.Select(s => s.Cinema.City)
+                .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).Take(40).ToList()
+        });
 
     private static bool Matches(string? text, string? query) =>
         string.IsNullOrWhiteSpace(query) || (text is not null &&
@@ -308,15 +594,15 @@ public sealed class RedisCinemaTools
             value = value[..^1].TrimEnd();
 
         return int.TryParse(value, NumberStyles.None,
-            CultureInfo.InvariantCulture, out var minimumAge) && userAge >= minimumAge;
+            CultureInfo.InvariantCulture, out var minimumAge) && user.Age >= minimumAge;
     }
 
-    private static DateOnly? ParseDate(string? value, string argument) =>
+    private static DateOnly? ParseDate(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null
             : DateOnly.TryParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date)
                 ? date : null;
 
-    private static TimeOnly? ParseTime(string? value, string argument) =>
+    private static TimeOnly? ParseTime(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null
             : TimeOnly.TryParseExact(value, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var time)
                 ? time : null;

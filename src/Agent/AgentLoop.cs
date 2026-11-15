@@ -1,5 +1,5 @@
-using Microsoft.Extensions.AI;
 using System.Text.Json;
+using Microsoft.Extensions.AI;
 
 namespace CinemaAgent.Agent;
 
@@ -7,12 +7,9 @@ namespace CinemaAgent.Agent;
 /// Ręczna pętla Tool Calling. Model PROPONUJE wywołanie narzędzia (FunctionCallContent),
 /// a aplikacja je waliduje, wykonuje i oddaje wynik (FunctionResultContent).
 /// </summary>
-public sealed class AgentLoop(
-    IChatClient chat, IReadOnlyList<AIFunction> tools, AgentOptions opt,
-    IReadOnlyList<string>? blockedMovieTitles = null)
+public sealed class AgentLoop(IChatClient chat, IReadOnlyList<AIFunction> tools, AgentOptions opt)
 {
     readonly Dictionary<string, AIFunction> _byName = tools.ToDictionary(t => t.Name);
-    readonly IReadOnlyList<string> _blockedMovieTitles = blockedMovieTitles ?? [];
 
     public async Task<string> RunTurnAsync(List<ChatMessage> history, string userMessage)
     {
@@ -45,9 +42,6 @@ public sealed class AgentLoop(
                 }
                 else
                 {
-                    if (_blockedMovieTitles.Any(title => response.Text.Contains(title, StringComparison.OrdinalIgnoreCase)))
-                        return "Nie mogę zaproponować filmu z powodu ograniczeń kategorii wiekowej. Mogę znaleźć inne seanse.";
-
                     history.AddRange(response.Messages);
                     return response.Text;
                 }
@@ -150,12 +144,12 @@ public sealed class AgentLoop(
     };
 
     void Log(string text, ConsoleColor color)
-{
-    if (!opt.Debug) return;
-    Console.ForegroundColor = color;
-    Console.WriteLine(text);
-    Console.ResetColor();
-}
+    {
+        if (!opt.Debug) return;
+        Console.ForegroundColor = color;
+        Console.WriteLine(text);
+        Console.ResetColor();
+    }
 
     async Task<object?> ExecuteAsync(FunctionCallContent call, CancellationToken ct)
     {
@@ -173,7 +167,7 @@ public sealed class AgentLoop(
         try
         {
             var result = await fn.InvokeAsync(new AIFunctionArguments(call.Arguments), ct);
-            var json = System.Text.Json.JsonSerializer.Serialize(result);
+            var json = result is JsonElement element ? element.GetRawText() : JsonSerializer.Serialize(result);
             Log($"  [result] {(json.Length > 500 ? json[..500] + "…" : json)}", ConsoleColor.DarkGray);
             return result;
         }
