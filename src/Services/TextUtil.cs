@@ -5,6 +5,9 @@ namespace CinemaAgent.Services;
 
 public static class TextUtil
 {
+
+
+    // TODO: Delete all references    
     /// <summary>Małe litery bez polskich znaków diakrytycznych - do tolerancyjnego dopasowania.</summary>
     public static string Norm(string s)
     {
@@ -16,6 +19,8 @@ public static class TextUtil
         return sb.ToString();
     }
 
+
+    // TODO: Delete
     public static bool ContainsAllTokens(string haystack, string query)
     {
         var h = Norm(haystack);

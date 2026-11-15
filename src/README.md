@@ -1,104 +1,164 @@
 # CinemaAgent – agent AI (Tool Calling) do repertuaru kin
 
-Wymagania: .NET SDK 9, Ollama (`ollama pull gemma4`).
+Asystent odpowiadający po polsku na pytania o repertuar kin. Model (Ollama) proponuje wywołania narzędzi, a aplikacja je waliduje, wykonuje i oddaje wyniki. Dane o kinach, filmach i seansach pochodzą ze scrapera Kinowo i mogą być czytane z **Redisa** albo z **lokalnych plików JSON** (bez Redisa).
 
-Uruchomienie:
+## Wymagania
 
-    dotnet run -- --user anna
-    dotnet run -- --user piotr --ask "Znajdź film fantasy na czwartek wieczór"
-    dotnet run -- --user ola --ask "Podaj mi najbliższy film w Multikino Złote Tarasy"
+| Komponent | Do czego | Wymagany |
+|---|---|---|
+| .NET SDK 9 | uruchomienie agenta | tak |
+| Ollama + model (`ollama pull gemma4`) | model językowy | tak |
+| Python 3.9+ (zalecany 3.12) | scraper `kinowo_scraper_redis.py` | tak, do pobrania danych |
+| Redis 8 lub Redis Stack (moduł JSON) | źródło danych w trybie Redis | tylko w trybie Redis |
 
-Użytkownicy: anna, piotr, ola (`Users/UserProfiles.cs`).
-Konfiguracja: `appsettings.json` lub zmienne środowiskowe, np. `Ollama__Model=qwen3:14b`.
+## Szybki start (bez Redisa)
 
-Przed uruchomieniem aplikacja sprawdza model przez endpoint Ollama `/api/tags`. Jeśli go brakuje, wypisuje polecenie `ollama pull <model>` i kończy działanie.
+```powershell
+# 1. Pobierz repertuar jednego miasta do plików JSON
+python kinowo_scraper_redis.py --city warszawa --output-dir data/kinowo
 
-Twarde ograniczenie kategorii wiekowej można włączyć w `Agent.EnforceAgeRating` w `appsettings.json` (lub przez `Agent__EnforceAgeRating=true`). Gdy opcja jest włączona, wyniki wyszukiwania filmów i seansów nie zawierają pozycji z kategorią wyższą niż wiek użytkownika; nieznane formaty kategorii są odrzucane.
-
-Pole `Description` w profilu użytkownika jest dołączane do promptu jako dodatkowy kontekst przy doborze filmu.
-
-
-
-## Kinowo Scraper – eksport repertuaru kin do JSON
-
-Scraper jest na obecnym etapie osobnym komponentem projektu. Jego zadaniem jest pobieranie repertuaru ze strony Kinowo i eksportowanie danych do pliku JSON.
-
-### Wymagania
-
-- Python 3.12 (64-bit)
-- pip
-
-### Struktura
-
-```text
-cinema-ai-assistant/
-├── .venv/
-├── requirements.txt
-├── kinowo_scraper.py
-└── ...
+# 2. Uruchom agenta na lokalnych danych
+dotnet run -- --user anna --data data/kinowo
 ```
 
-### Instalacja i uruchomienie (Windows)
+Agent wypisze podsumowanie wczytanych danych (liczba filmów, seansów, miast i zakres dat), a potem przejdzie do trybu interaktywnego (pusta linia lub `exit` kończy).
 
-Wszystkie poniższe polecenia należy wykonywać w terminalu PowerShell, w katalogu projektu.
+## Uruchomienie agenta
 
-**1. Utworzenie środowiska wirtualnego**
+```powershell
+dotnet run -- --user anna
+dotnet run -- --user piotr --data data/kinowo --ask "Znajdź film fantasy na czwartek wieczór"
+dotnet run -- --user ola   --ask "Podaj mi najbliższy film w Multikino Złote Tarasy"
+```
+
+| Argument | Znaczenie |
+|---|---|
+| `--user <id>` | profil użytkownika: `anna`, `piotr`, `ola` (`Users/UserProfiles.cs`), domyślnie `anna` |
+| `--ask "<pytanie>"` | jedno pytanie i koniec; bez tego tryb interaktywny |
+| `--data <ścieżka>` | dane lokalne zamiast Redisa: katalog z plikami `{slug-miasta}.json` albo pojedynczy plik |
+
+Przed startem aplikacja sprawdza model przez endpoint Ollamy `/api/tags`. Jeśli go brakuje, wypisuje polecenie `ollama pull <model>` i kończy działanie.
+
+## Źródła danych
+
+Agent czyta dane przez interfejs `ICinemaStore` (`Storage/`). Wybór źródła:
+
+- **Dane lokalne** – gdy podano `--data` albo ustawiono `Data:LocalPath` w `appsettings.json`. Nie wymaga Redisa.
+- **Redis** – w pozostałych przypadkach. Adres w `Redis:ConnectionString` (domyślnie `127.0.0.1:6379`).
+
+Oba tryby zwracają te same wyniki, bo `LocalCinemaStore` odtwarza w pamięci klucze i dokumenty, które scraper zapisuje do Redisa.
+
+### Nieaktualne dane lokalne
+
+Narzędzia pomijają seanse z przeszłości. Jeśli pliki są starsze niż dziś, agent ostrzeże o tym przy starcie. Wtedy ustaw sztuczny czas:
+
+```powershell
+$env:Agent__Now = "2026-11-16T18:00"
+dotnet run -- --user anna --data data/kinowo
+```
+
+Wartość bez strefy jest traktowana jako czas warszawski.
+
+### Redis – rozwiązywanie problemów
+
+Przy błędach typu `SocketClosed` / `message timed out in the backlog` sprawdź `redis-cli ping` i ustaw w connection stringu keep-alive oraz dłuższe timeouty:
+
+```
+127.0.0.1:6379,abortConnect=false,connectTimeout=10000,syncTimeout=10000,keepAlive=15,connectRetry=5
+```
+
+## Konfiguracja
+
+`appsettings.json` lub zmienne środowiskowe (separator `__`, np. `Ollama__Model=qwen3:14b`).
+
+| Klucz | Domyślnie | Opis |
+|---|---|---|
+| `Ollama:Endpoint` | `http://localhost:11434` | adres Ollamy |
+| `Ollama:Model` | `gemma4` | model |
+| `Ollama:NumCtx` | `16384` | okno kontekstu wysyłane do każdego żądania |
+| `Agent:MaxIterations` | `6` | limit iteracji pętli narzędzi w jednej turze |
+| `Agent:TimeoutSeconds` | `1800` | limit czasu jednej tury |
+| `Agent:Temperature` / `Agent:Seed` | `0` / `42` | powtarzalność odpowiedzi |
+| `Agent:Now` | `null` | sztuczny czas (patrz wyżej) |
+| `Agent:Debug` | `true` | log wywołań narzędzi, wyników i przycinania historii |
+| `Agent:EnforceAgeRating` | `true` | twarde ograniczenie kategorii wiekowej |
+| `Data:LocalPath` | `null` | ścieżka do danych lokalnych |
+| `Redis:ConnectionString` | `127.0.0.1:6379` | połączenie z Redisem |
+
+## Profile użytkowników
+
+Profil (`Models/UserProfile.cs`) zawiera: imię, wiek, miasto, lubiane i niechciane gatunki, preferowaną sieć kin i porę dnia oraz opis. Cały profil trafia do promptu systemowego, a opis jest w nim oznaczony jako dane użytkownika, nie jako polecenia.
+
+Profil wpływa też na narzędzia:
+
+- **Miasto** z profilu jest domyślnym filtrem w `get_screenings` i `find_cinemas`. Nie obowiązuje, gdy podano konkretne kino. Użytkownik może poprosić o inne miasto albo o wszystkie (`city="all"`).
+- **Niechciane gatunki** są domyślnie ukrywane w `get_screenings` i `search_movies`. Pojawiają się dopiero, gdy użytkownik poda tytuł albo wprost poprosi o ten gatunek.
+- **Ograniczenie wieku:** gdy `Agent:EnforceAgeRating` jest włączone, wyniki nie zawierają filmów z kategorią wyższą niż wiek użytkownika. Nieznane formaty kategorii są odrzucane.
+- Jeśli dla miasta nie ma danych (np. Biłgoraj), agent informuje o tym i proponuje miasta, które dane mają.
+
+## Struktura projektu
+
+```text
+Program.cs                    wejście: konfiguracja, wybór źródła danych, pętla pytań
+Agent/
+  AgentLoop.cs                pętla tool calling
+  SystemPrompt.cs             budowanie promptu (profil, kalendarz, zasady)
+  HistoryTrimmer.cs           opcjonalne przycinanie historii (można usunąć)
+Tools/CinemaTools.cs          narzędzia dla modelu
+Storage/
+  ICinemaStore.cs             źródło danych
+  RedisCinemaStore.cs         Redis JSON
+  LocalCinemaStore.cs         lokalne pliki JSON ze scrapera
+Models/UserProfile.cs         profil użytkownika
+Users/UserProfiles.cs         zdefiniowani użytkownicy
+Services/TextUtil.cs          nazwy dni tygodnia
+kinowo_scraper_redis.py             scraper Kinowo
+```
+
+`HistoryTrimmer` ogranicza rozmiar historii rozmowy (stare tury tracą wyniki narzędzi). Instrukcja usunięcia jest w komentarzu na górze klasy.
+
+## Kinowo Scraper
+
+Scraper pobiera repertuar ze strony Kinowo i zapisuje go do Redis JSON albo do plików JSON. Korzysta tylko z biblioteki standardowej Pythona. Pakiety `redis` i `tzdata` są potrzebne wyłącznie do zapisu w Redisie.
+
+### Instalacja (Windows, PowerShell)
+
+Polecenia wykonuj w katalogu projektu.
 
 ```powershell
 py -3.12 -m venv .venv
-```
-
-**2. Aktywacja środowiska**
-
-```powershell
 .venv\Scripts\Activate.ps1
-```
-
-**3. Aktualizacja pip i instalacja zależności**
-
-```powershell
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-**4. Uruchomienie scrapera**
+Przy kolejnych uruchomieniach wystarczy aktywować środowisko (`.venv\Scripts\Activate.ps1`). Wyjście: `deactivate`.
+
+### Tryby pracy
 
 ```powershell
-python kinowo_scraper.py -o repertuar.json
+# Pliki JSON, jedno miasto (zalecane dla kontrybutorów bez Redisa)
+python kinowo_scraper_redis.py --city warszawa --output-dir data/kinowo
+
+# Pliki JSON, wszystkie miasta z mapy strony (2 s przerwy między żądaniami)
+python kinowo_scraper_redis.py --output-dir data/kinowo
+
+# Pojedynczy plik; nazwa musi być slugiem miasta, jeśli ma trafić do --data
+python kinowo_scraper_redis.py --city warszawa -o data/kinowo/warszawa.json
+
+# Zapis do Redisa (Redis 8 lub Redis Stack); adres w zmiennej REDIS_URL
+python kinowo_scraper_redis.py --redis --city warszawa
 ```
 
-Wynikiem działania programu jest plik `repertuar.json` zawierający pobrany repertuar w formacie JSON.
+Bez żadnej z opcji zapisu (`--redis`, `--output-dir`, `-o`, `--html`) scraper zapisuje do Redisa. Opcja `--html <plik>` wczytuje zapisaną stronę zamiast pobierać ją z sieci.
 
-### Ponowne uruchomienie
+W Redisie klucze repertuaru wygasają o północy w dniu seansu, a dane filmów są zapisywane tylko raz (`NX`). Przy zapisie do plików nic nie wygasa.
 
-Przy kolejnych uruchomieniach nie trzeba ponownie tworzyć środowiska ani instalować zależności.
-
-Wystarczy aktywować środowisko i uruchomić skrypt:
-
-```powershell
-.venv\Scripts\Activate.ps1
-python kinowo_scraper.py -o repertuar.json
-```
-
-Po zakończeniu pracy można dezaktywować środowisko:
-
-```powershell
-deactivate
-```
-
-### Zależności
-
-Zależności scrapera znajdują się w pliku `requirements.txt`.
-
-Aktualnie wymagany pakiet:
-
-- `lxml` – parsowanie dokumentów HTML i XML.
-
-Środowisko wirtualne `.venv` nie powinno być dodawane do repozytorium Git. Należy uwzględnić je w pliku `.gitignore`:
+### .gitignore
 
 ```gitignore
 .venv/
 __pycache__/
 *.py[cod]
+data/kinowo/
 ```
-

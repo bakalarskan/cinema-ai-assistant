@@ -1,1 +1,4 @@
-lxml==6.0.2
+# Potrzebne tylko do zapisu do Redisa (kinowo_scraper.py --redis).
+# Zapis do plików JSON działa na samej bibliotece standardowej.
+redis
+tzdata

@@ -1,14 +1,31 @@
+using System.Globalization;
+using System.Text.Json;
 using CinemaAgent.Agent;
-using CinemaAgent.Services;
+using CinemaAgent.Storage;
 using CinemaAgent.Tools;
 using CinemaAgent.Users;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
 using OllamaSharp;
-using System.Text.Json;
+using StackExchange.Redis;
+using OllamaChatRequest = OllamaSharp.Models.Chat.ChatRequest;
+using OllamaRequestOptions = OllamaSharp.Models.RequestOptions;
 
-// Użycie: dotnet run -- --user anna [--ask "Znajdź horror na piątek wieczór"]
-string? Arg(string name) { var i = Array.IndexOf(args, name); return i >= 0 && i + 1 < args.Length ? args[i + 1] : null; }
+// Użycie: dotnet run -- --user anna [--data data/kinowo] [--ask "Znajdź horror na piątek wieczór"]
+string? Arg(string name)
+{
+    var i = Array.IndexOf(args, name);
+    return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
+}
+
+// Sztuczny czas z konfiguracji: wartość bez strefy traktujemy jako czas warszawski.
+static DateTimeOffset ParseNow(string value, TimeZoneInfo zone)
+{
+    var parsed = DateTime.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+    return parsed.Kind == DateTimeKind.Unspecified
+        ? new DateTimeOffset(parsed, zone.GetUtcOffset(parsed))
+        : new DateTimeOffset(parsed);
+}
 
 var cfg = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
@@ -18,7 +35,8 @@ var cfg = new ConfigurationBuilder()
 
 var ollama = cfg.GetSection("Ollama").Get<OllamaOptions>() ?? new();
 var agentOpt = cfg.GetSection("Agent").Get<AgentOptions>() ?? new();
-var dataDir = cfg["DataDirectory"] ?? "data";
+var redisConnection = cfg["Redis:ConnectionString"] ?? "127.0.0.1:6379";
+var numCtx = int.TryParse(cfg["Ollama:NumCtx"], out var configuredCtx) ? configuredCtx : 16384;
 
 var userId = Arg("--user") ?? "anna";
 if (!UserProfiles.All.TryGetValue(userId, out var user))
@@ -41,10 +59,12 @@ using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) })
             .Select(m => m.GetProperty("name").GetString())
             .Where(n => !string.IsNullOrWhiteSpace(n))
             .ToList();
+
         static string NormalizeModelName(string name) =>
             name.EndsWith(":latest", StringComparison.OrdinalIgnoreCase) ? name[..^7] : name;
 
-        if (!models.Any(name => string.Equals(NormalizeModelName(name!), NormalizeModelName(ollama.Model), StringComparison.OrdinalIgnoreCase)))
+        if (!models.Any(name => string.Equals(
+                NormalizeModelName(name!), NormalizeModelName(ollama.Model), StringComparison.OrdinalIgnoreCase)))
         {
             Console.Error.WriteLine($"Brak modelu Ollama '{ollama.Model}'. Pobierz go poleceniem: ollama pull {ollama.Model}");
             return 1;
@@ -58,51 +78,128 @@ using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) })
     }
 }
 
-var now = agentOpt.Now is not null ? DateTimeOffset.Parse(agentOpt.Now) : DateTimeOffset.Now;
-var repo = new CinemaRepository(dataDir);
-Console.WriteLine($"Dane: {repo.Cinemas.Count} kin, {repo.Movies.Count} filmów, {repo.Screenings.Count} seansów");
-var tools = new CinemaTools(repo, user, now, agentOpt.EnforceAgeRating).CreateAll();
+// Cały agent (prompt i narzędzia) pracuje w czasie warszawskim, niezależnie od strefy maszyny.
+var warsaw = TimeZoneInfo.FindSystemTimeZoneById("Europe/Warsaw");
+var now = TimeZoneInfo.ConvertTime(
+    agentOpt.Now is { } fixedNow ? ParseNow(fixedNow, warsaw) : DateTimeOffset.UtcNow, warsaw);
 
-// Zmiana dostawcy modelu = podmiana implementacji IChatClient
-IChatClient chat = new OllamaApiClient(new Uri(ollama.Endpoint), ollama.Model);
-var blockedMovieTitles = agentOpt.EnforceAgeRating
-    ? repo.Movies.Where(m => !AgeRatingPolicy.IsAllowed(m.AgeRating, user.Age))
-        .SelectMany(m => new[] { m.Title, m.OriginalTitle })
-        .Where(title => !string.IsNullOrWhiteSpace(title)).Select(title => title!).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
-    : new List<string>();
-var agent = new AgentLoop(chat, tools, agentOpt, blockedMovieTitles);
-
-var history = new List<ChatMessage> { new(ChatRole.System, SystemPrompt.Build(user, now, agentOpt.EnforceAgeRating)) };
-
-Console.WriteLine($"Użytkownik: {user.Name} | model: {ollama.Model} | teraz: {now:yyyy-MM-dd HH:mm}");
-
-async Task Ask(string q)
+// Źródło danych: lokalne pliki JSON ze scrapera (--data <ścieżka> albo Data:LocalPath) lub Redis.
+var localData = Arg("--data") ?? cfg["Data:LocalPath"];
+ConnectionMultiplexer? redis = null;
+ICinemaStore store;
+if (!string.IsNullOrWhiteSpace(localData))
 {
-    try { Console.WriteLine($"\n{await agent.RunTurnAsync(history, q)}\n"); }
-    catch (OperationCanceledException)
+    try
     {
-        Console.WriteLine("\nOdpowiedź trwa zbyt długo. Spróbuj ponownie.\n");
+        var local = LocalCinemaStore.Load(localData);
+        Console.WriteLine(local.Summary);
+        store = local;
+    }
+    catch (Exception ex) when (ex is IOException or InvalidDataException or JsonException)
+    {
+        Console.Error.WriteLine($"Nie można wczytać danych lokalnych ({localData}): {ex.Message}");
+        return 1;
+    }
+}
+else
+{
+    try
+    {
+        redis = await ConnectionMultiplexer.ConnectAsync(redisConnection);
+        store = new RedisCinemaStore(redis);
     }
     catch (Exception ex)
     {
-        Console.WriteLine("\nPrzepraszam, coś poszło nie tak. Spróbuj ponownie za chwilę.\n");
-        if (agentOpt.Debug)
-        {
-            var incomplete = repo.Cinemas.Where(c => c.Address is null).Select(c => c.Id).ToList();
-            if (incomplete.Count > 0)
-                Console.WriteLine($"Kina bez adresu ({incomplete.Count}): {string.Join(", ", incomplete)}");
-        }
+        Console.Error.WriteLine($"Nie można połączyć się z Redisem ({redisConnection}): {ex.Message}");
+        return 1;
     }
 }
 
-if (Arg("--ask") is { } single) { await Ask(single); return 0; }
-
-Console.WriteLine("Zadaj pytanie (pusta linia / 'exit' kończy).");
-while (true)
+using (redis)
 {
-    Console.Write("> ");
-    var line = Console.ReadLine();
-    if (string.IsNullOrWhiteSpace(line) || line.Trim().Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
-    await Ask(line);
+    var cinemaTools = new CinemaTools(
+        store,
+        user,
+        agentOpt.EnforceAgeRating,
+        // Gdy w konfiguracji ustawiono sztuczny czas, narzędzia muszą używać tego samego zegara co prompt.
+        utcNow: agentOpt.Now is not null ? () => now.ToUniversalTime() : null);
+
+    var tools = cinemaTools.CreateAll();
+
+    // Zmiana dostawcy modelu = podmiana implementacji IChatClient.
+    // NumCtxClient dopisuje num_ctx do każdego żądania, więc Ollama nie wraca do domyślnych 4096.
+    IChatClient chat = new NumCtxClient(new OllamaApiClient(new Uri(ollama.Endpoint), ollama.Model), numCtx);
+
+    // Opcjonalne przycinanie historii (ok. połowa okna kontekstu). Aby wyłączyć: usuń te dwie linie i argument trimmer.
+    var trimmer = new HistoryTrimmer(maxChars: numCtx * 3 / 2, log: agentOpt.Debug ? (m => Console.WriteLine(m)) : null);
+    var agent = new AgentLoop(chat, tools, agentOpt, trimmer);
+
+    var history = new List<ChatMessage>
+    {
+        new(ChatRole.System, SystemPrompt.Build(user, now, agentOpt.EnforceAgeRating))
+    };
+
+    Console.WriteLine($"Użytkownik: {user.Name} | model: {ollama.Model} | num_ctx: {numCtx} | teraz: {now:yyyy-MM-dd HH:mm}");
+
+    async Task Ask(string q)
+    {
+        try
+        {
+            var answer = await agent.RunTurnAsync(history, q);
+            if (string.IsNullOrWhiteSpace(answer))
+                Console.WriteLine("\n[model zwrócił pustą odpowiedź — sprawdź log Ollamy (n_ctx_slot, truncated)]\n");
+            else
+                Console.WriteLine($"\n{answer}\n");
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("\nOdpowiedź trwa zbyt długo. Spróbuj ponownie.\n");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n[błąd] {ex.GetType().Name}: {ex.Message}");
+            if (ex.InnerException is not null)
+                Console.WriteLine($"        {ex.InnerException.Message}");
+            Console.WriteLine();
+        }
+    }
+
+    if (Arg("--ask") is { } single)
+    {
+        await Ask(single);
+        return 0;
+    }
+
+    Console.WriteLine("Zadaj pytanie (pusta linia / 'exit' kończy).");
+    while (true)
+    {
+        Console.Write("> ");
+        var line = Console.ReadLine();
+        if (string.IsNullOrWhiteSpace(line) || line.Trim().Equals("exit", StringComparison.OrdinalIgnoreCase))
+            break;
+        await Ask(line);
+    }
+    return 0;
 }
-return 0;
+
+// Nakłada num_ctx na każde żądanie do Ollamy.
+sealed class NumCtxClient(IChatClient inner, int numCtx) : DelegatingChatClient(inner)
+{
+    private ChatOptions Patch(ChatOptions? options)
+    {
+        options = options?.Clone() ?? new ChatOptions();
+        options.RawRepresentationFactory = _ => new OllamaChatRequest
+        {
+            Options = new OllamaRequestOptions { NumCtx = numCtx }
+        };
+        return options;
+    }
+
+    public override Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        => base.GetResponseAsync(messages, Patch(options), cancellationToken);
+
+    public override IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        => base.GetStreamingResponseAsync(messages, Patch(options), cancellationToken);
+}
