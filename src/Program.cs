@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using CinemaAgent.Agent;
+using CinemaAgent.Storage;
 using CinemaAgent.Tools;
 using CinemaAgent.Users;
 using Microsoft.Extensions.AI;
@@ -10,7 +11,7 @@ using StackExchange.Redis;
 using OllamaChatRequest = OllamaSharp.Models.Chat.ChatRequest;
 using OllamaRequestOptions = OllamaSharp.Models.RequestOptions;
 
-// Użycie: dotnet run -- --user anna [--ask "Znajdź horror na piątek wieczór"]
+// Użycie: dotnet run -- --user anna [--data data/kinowo] [--ask "Znajdź horror na piątek wieczór"]
 string? Arg(string name)
 {
     var i = Array.IndexOf(args, name);
@@ -82,21 +83,42 @@ var warsaw = TimeZoneInfo.FindSystemTimeZoneById("Europe/Warsaw");
 var now = TimeZoneInfo.ConvertTime(
     agentOpt.Now is { } fixedNow ? ParseNow(fixedNow, warsaw) : DateTimeOffset.UtcNow, warsaw);
 
-ConnectionMultiplexer redis;
-try
+// Źródło danych: lokalne pliki JSON ze scrapera (--data <ścieżka> albo Data:LocalPath) lub Redis.
+var localData = Arg("--data") ?? cfg["Data:LocalPath"];
+ConnectionMultiplexer? redis = null;
+ICinemaStore store;
+if (!string.IsNullOrWhiteSpace(localData))
 {
-    redis = await ConnectionMultiplexer.ConnectAsync(redisConnection);
+    try
+    {
+        var local = LocalCinemaStore.Load(localData);
+        Console.WriteLine(local.Summary);
+        store = local;
+    }
+    catch (Exception ex) when (ex is IOException or InvalidDataException or JsonException)
+    {
+        Console.Error.WriteLine($"Nie można wczytać danych lokalnych ({localData}): {ex.Message}");
+        return 1;
+    }
 }
-catch (Exception ex)
+else
 {
-    Console.Error.WriteLine($"Nie można połączyć się z Redisem ({redisConnection}): {ex.Message}");
-    return 1;
+    try
+    {
+        redis = await ConnectionMultiplexer.ConnectAsync(redisConnection);
+        store = new RedisCinemaStore(redis);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Nie można połączyć się z Redisem ({redisConnection}): {ex.Message}");
+        return 1;
+    }
 }
 
 using (redis)
 {
-    var cinemaTools = new RedisCinemaTools(
-        redis,
+    var cinemaTools = new CinemaTools(
+        store,
         user,
         agentOpt.EnforceAgeRating,
         // Gdy w konfiguracji ustawiono sztuczny czas, narzędzia muszą używać tego samego zegara co prompt.
@@ -108,7 +130,9 @@ using (redis)
     // NumCtxClient dopisuje num_ctx do każdego żądania, więc Ollama nie wraca do domyślnych 4096.
     IChatClient chat = new NumCtxClient(new OllamaApiClient(new Uri(ollama.Endpoint), ollama.Model), numCtx);
 
-    var agent = new AgentLoop(chat, tools, agentOpt);
+    // Opcjonalne przycinanie historii (ok. połowa okna kontekstu). Aby wyłączyć: usuń te dwie linie i argument trimmer.
+    var trimmer = new HistoryTrimmer(maxChars: numCtx * 3 / 2, log: agentOpt.Debug ? (m => Console.WriteLine(m)) : null);
+    var agent = new AgentLoop(chat, tools, agentOpt, trimmer);
 
     var history = new List<ChatMessage>
     {

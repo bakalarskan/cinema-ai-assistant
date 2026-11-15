@@ -7,12 +7,15 @@ namespace CinemaAgent.Agent;
 /// Ręczna pętla Tool Calling. Model PROPONUJE wywołanie narzędzia (FunctionCallContent),
 /// a aplikacja je waliduje, wykonuje i oddaje wynik (FunctionResultContent).
 /// </summary>
-public sealed class AgentLoop(IChatClient chat, IReadOnlyList<AIFunction> tools, AgentOptions opt)
+public sealed class AgentLoop(
+    IChatClient chat, IReadOnlyList<AIFunction> tools, AgentOptions opt,
+    HistoryTrimmer? trimmer = null)
 {
     readonly Dictionary<string, AIFunction> _byName = tools.ToDictionary(t => t.Name);
 
     public async Task<string> RunTurnAsync(List<ChatMessage> history, string userMessage)
     {
+        trimmer?.Trim(history);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(opt.TimeoutSeconds));
         history.Add(new ChatMessage(ChatRole.User, userMessage));
 
