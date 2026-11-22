@@ -1,5 +1,6 @@
-using System.Text.Json;
 using Microsoft.Extensions.AI;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace CinemaAgent.Agent;
 
@@ -13,10 +14,15 @@ public sealed class AgentLoop(
 {
     readonly Dictionary<string, AIFunction> _byName = tools.ToDictionary(t => t.Name);
 
-    public async Task<string> RunTurnAsync(List<ChatMessage> history, string userMessage)
+    public async Task<string> RunTurnAsync(
+        List<ChatMessage> history,
+        string userMessage)
     {
         trimmer?.Trim(history);
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(opt.TimeoutSeconds));
+
+        using var cts = new CancellationTokenSource(
+            TimeSpan.FromSeconds(opt.TimeoutSeconds));
+
         history.Add(new ChatMessage(ChatRole.User, userMessage));
 
         var options = new ChatOptions
@@ -27,38 +33,165 @@ public sealed class AgentLoop(
             Seed = opt.Seed
         };
 
+        var toolNames = tools
+            .Select(tool => tool.Name)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var requireNativeCall = false;
+
         for (var i = 1; i <= opt.MaxIterations; i++)
         {
-            var response = await chat.GetResponseAsync(history, options, cts.Token);
+            options.ToolMode = requireNativeCall
+                ? ChatToolMode.RequireAny
+                : ChatToolMode.Auto;
 
-            var calls = response.Messages.SelectMany(m => m.Contents)
-                                         .OfType<FunctionCallContent>().ToList();
-            if (calls.Count == 0)
+            // Instrukcja naprawcza dotyczy tylko bieżącego żądania.
+            var requestHistory = history.ToList();
+
+            if (requireNativeCall)
             {
-                // Niektóre modele zwracają "plan wywołania" jako tekst/JSON zamiast
-                // FunctionCallContent. Odzyskaj wyłącznie JSON wskazujący znane narzędzie.
-                calls = ExtractTextFunctionCalls(response.Text);
+                requestHistory.Add(new ChatMessage(
+                    ChatRole.System,
+                    """
+                Your previous response contained textual tool instructions
+                instead of native function calls.
+
+                Use the provided tools through the native function-calling
+                interface. Select the appropriate tool and provide arguments
+                matching its schema.
+
+                For get_screenings:
+                - genre contains movie genres, such as Sci-Fi or Dramat.
+                - format contains screening formats, such as 3D, IMAX, NAP or DUB.
+
+                After receiving tool results, continue working on the user's
+                request and provide a final answer in Polish.
+                """));
+            }
+
+            var response = await chat.GetResponseAsync(
+                requestHistory,
+                options,
+                cts.Token);
+
+            var calls = response.Messages
+                .SelectMany(message => message.Contents)
+                .OfType<FunctionCallContent>()
+                .ToList();
+
+            if (calls.Count > 0)
+            {
+                history.AddRange(response.Messages);
+            }
+            else
+            {
+                var text = response.Text ?? string.Empty;
+
+                // Np. find_cinemas(city='Warszawa').
+                // Sprawdzenie działa również wewnątrz bloku Markdown.
+                if (ContainsTextToolInvocation(text, toolNames))
+                {
+                    Log(
+                        "  [tool recovery] Wykryto tekstowe instrukcje " +
+                        "narzędzi. Ponawiam żądanie z wymuszeniem tool calla.",
+                        ConsoleColor.DarkYellow);
+
+                    history.AddRange(response.Messages);
+                    requireNativeCall = true;
+                    continue;
+                }
+
+                // Zachowujemy dotychczasowe odzyskiwanie JSON-a.
+                calls = ExtractTextFunctionCalls(text);
+
+                if (calls.Count == 0)
+                {
+                    var blocks = Regex.Matches(
+                        text,
+                        @"```[ \t]*(?:json)?[ \t]*\r?\n?(?<json>[\s\S]*?)```",
+                        RegexOptions.IgnoreCase |
+                        RegexOptions.CultureInvariant);
+
+                    foreach (Match block in blocks)
+                    {
+                        var recovered = ExtractTextFunctionCalls(
+                            block.Groups["json"].Value.Trim());
+
+                        calls.AddRange(recovered);
+                    }
+                }
+
                 if (calls.Count > 0)
                 {
-                    Log("  [tool recovery] Wykryto tekstowy zapis wywołania narzędzia.", ConsoleColor.DarkYellow);
-                    history.Add(new ChatMessage(ChatRole.Assistant, calls.Select(c => (AIContent)c).ToList()));
+                    Log(
+                        "  [tool recovery] Wykryto JSON wskazujący narzędzie.",
+                        ConsoleColor.DarkYellow);
+
+                    history.Add(new ChatMessage(
+                        ChatRole.Assistant,
+                        calls.Select(call => (AIContent)call).ToList()));
                 }
                 else
                 {
+                    // Po wymuszeniu wywołania nie kończymy tury tekstem,
+                    // który mógłby zastępować niewykonane narzędzie.
+                    if (requireNativeCall)
+                    {
+                        history.AddRange(response.Messages);
+                        continue;
+                    }
+
                     history.AddRange(response.Messages);
-                    return response.Text;
+                    return text;
                 }
             }
-            else
-                history.AddRange(response.Messages);
 
             var results = new List<AIContent>();
+
             foreach (var call in calls)
-                results.Add(new FunctionResultContent(call.CallId, await ExecuteAsync(call, cts.Token)));
+            {
+                var result = await ExecuteAsync(call, cts.Token);
+
+                results.Add(new FunctionResultContent(
+                    call.CallId,
+                    result));
+            }
 
             history.Add(new ChatMessage(ChatRole.Tool, results));
+
+            // Narzędzia zostały wykonane. Model może teraz udzielić odpowiedzi
+            // lub samodzielnie zdecydować o kolejnym wywołaniu.
+            requireNativeCall = false;
         }
-        return $"Przerwano: przekroczono limit {opt.MaxIterations} iteracji agenta.";
+
+        return "Nie udało się zakończyć wyszukiwania w dostępnym " +
+               $"limicie {opt.MaxIterations} kroków. Spróbuj ponownie.";
+    }
+
+    private static bool ContainsTextToolInvocation(
+        string text,
+        IReadOnlySet<string> toolNames)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        foreach (var name in toolNames)
+        {
+            var pattern =
+                @"(?<![\p{L}\p{N}_])" +
+                Regex.Escape(name) +
+                @"\s*\(";
+
+            if (Regex.IsMatch(
+                text,
+                pattern,
+                RegexOptions.CultureInvariant))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     List<FunctionCallContent> ExtractTextFunctionCalls(string text)

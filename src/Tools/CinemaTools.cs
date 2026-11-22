@@ -146,7 +146,10 @@ public sealed class CinemaTools
         [Description("Max films per page (1-30)")] int limit = 20,
         [Description("Number of films to skip, for the next page")] int offset = 0,
         [Description("City name or Kinowo slug, e.g. Warszawa, trojmiasto. Defaults to the user's home city; 'all' = every city")] string? city = null,
+        [Description("Screening format tokens, e.g. 3D, IMAX, NAP, DUB or 'IMAX 3D NAP'. " +
+        "All specified tokens must match. Omit to include every format.")] string? format = null,
         CancellationToken cancellationToken = default)
+
     {
         var startDate = ParseDate(dateFrom);
         var parsedEnd = ParseDate(dateTo);
@@ -156,73 +159,132 @@ public sealed class CinemaTools
 
         if ((!string.IsNullOrWhiteSpace(dateFrom) && startDate is null) ||
             (!string.IsNullOrWhiteSpace(dateTo) && parsedEnd is null))
+        {
             return Result(new { error = "Dates must be yyyy-MM-dd." });
+        }
+
         if ((!string.IsNullOrWhiteSpace(timeFrom) && startTime is null) ||
             (!string.IsNullOrWhiteSpace(timeTo) && endTime is null))
+        {
             return Result(new { error = "Times must be HH:mm." });
+        }
+
         if (startDate > endDate)
             return Result(new { error = "dateTo must be on or after dateFrom." });
+
         if (startTime > endTime)
             return Result(new { error = "timeTo must be at or after timeFrom." });
 
         var now = TimeZoneInfo.ConvertTime(utcNow(), Warsaw);
         var today = DateOnly.FromDateTime(now.DateTime);
 
-        var effectiveCity = EffectiveCity(city, specificTarget: !string.IsNullOrWhiteSpace(cinema));
+        var effectiveCity = EffectiveCity(
+            city,
+            specificTarget: !string.IsNullOrWhiteSpace(cinema));
+
         var allSchedules = await ListSchedules(cancellationToken);
-        var schedules = allSchedules.Where(schedule => Matches(schedule.Cinema.City, effectiveCity)).ToList();
+
+        var schedules = allSchedules
+            .Where(schedule => Matches(schedule.Cinema.City, effectiveCity))
+            .ToList();
+
         if (effectiveCity is not null && schedules.Count == 0)
             return CityNotFound(effectiveCity, allSchedules);
 
         var cinemas = FindCinemaEntries(schedules, cinema);
+
         if (!string.IsNullOrWhiteSpace(cinema) && cinemas.Count == 0)
             return CinemaNotFound(cinema, schedules);
 
-        var cinemaIds = cinemas.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
-        var selected = schedules.Where(schedule =>
-            cinemaIds.Contains(schedule.Cinema.Id) &&
-            schedule.Day >= today &&
-            (startDate is null || schedule.Day >= startDate) &&
-            (endDate is null || schedule.Day <= endDate)).ToDictionary(schedule => schedule.Key);
+        var cinemaIds = cinemas
+            .Select(item => item.Id)
+            .ToHashSet(StringComparer.Ordinal);
 
-        var documents = await ReadDocuments<ScreeningDocument[]>(selected.Keys, cancellationToken);
-        var candidates = new List<(ScheduleKey Schedule, ScreeningDocument Screening, DateTimeOffset StartsAt)>();
+        var selected = schedules
+            .Where(schedule =>
+                cinemaIds.Contains(schedule.Cinema.Id) &&
+                schedule.Day >= today &&
+                (startDate is null || schedule.Day >= startDate) &&
+                (endDate is null || schedule.Day <= endDate))
+            .ToDictionary(schedule => schedule.Key);
+
+        var documents = await ReadDocuments<ScreeningDocument[]>(
+            selected.Keys,
+            cancellationToken);
+
+        var candidates = new List<(
+            ScheduleKey Schedule,
+            ScreeningDocument Screening,
+            DateTimeOffset StartsAt)>();
+
         foreach (var (key, screenings) in documents)
         {
             var schedule = selected[key];
+
             foreach (var screening in screenings)
             {
-                if (screening is null || string.IsNullOrWhiteSpace(screening.MovieId) ||
-                    !TimeOnly.TryParseExact(screening.Time, "HH:mm", CultureInfo.InvariantCulture,
-                        DateTimeStyles.None, out var localTime) ||
+                if (screening is null ||
+                    string.IsNullOrWhiteSpace(screening.MovieId) ||
+                    !MatchesScreeningFormat(
+                        screening.Format,
+                        screening.Room,
+                        format) ||
+                    !TimeOnly.TryParseExact(
+                        screening.Time,
+                        "HH:mm",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.None,
+                        out var localTime) ||
                     (startTime is not null && localTime < startTime) ||
                     (endTime is not null && localTime > endTime))
+                {
                     continue;
+                }
 
-                var startsAt = NextStart(schedule.Day.ToDateTime(localTime), now);
+                var startsAt = NextStart(
+                    schedule.Day.ToDateTime(localTime),
+                    now);
+
                 if (startsAt is not null)
                     candidates.Add((schedule, screening, startsAt.Value));
             }
         }
 
         var hidden = HiddenGenres(title, genre);
-        var movieKeys = candidates.Select(candidate => $"movie:{candidate.Screening.MovieId}")
+
+        var movieKeys = candidates
+            .Select(candidate => $"movie:{candidate.Screening.MovieId}")
             .Distinct(StringComparer.Ordinal);
-        var movies = await ReadDocuments<MovieDocument>(movieKeys, cancellationToken);
+
+        var movies = await ReadDocuments<MovieDocument>(
+            movieKeys,
+            cancellationToken);
+
         var matching = candidates
-            .Select(candidate => (Candidate: candidate,
-                Movie: movies.GetValueOrDefault($"movie:{candidate.Screening.MovieId}")))
-            .Where(item => item.Movie is not null && IsAllowed(item.Movie.AgeRating) &&
-                MatchesMovie(item.Movie, title, genre) && !IsHidden(item.Movie, hidden))
+            .Select(candidate => (
+                Candidate: candidate,
+                Movie: movies.GetValueOrDefault(
+                    $"movie:{candidate.Screening.MovieId}")))
+            .Where(item =>
+                item.Movie is not null &&
+                IsAllowed(item.Movie.AgeRating) &&
+                MatchesMovie(item.Movie, title, genre) &&
+                !IsHidden(item.Movie, hidden))
             .OrderBy(item => item.Candidate.StartsAt)
-            .ThenBy(item => item.Candidate.Schedule.Cinema.Id, StringComparer.Ordinal)
-            .ThenBy(item => item.Candidate.Screening.MovieId, StringComparer.Ordinal)
+            .ThenBy(
+                item => item.Candidate.Schedule.Cinema.Id,
+                StringComparer.Ordinal)
+            .ThenBy(
+                item => item.Candidate.Screening.MovieId,
+                StringComparer.Ordinal)
             .ToList();
 
-        // GroupBy zachowuje kolejność pierwszego wystąpienia, więc filmy idą wg najbliższego seansu.
-        // Jeden film = jedna pozycja, niezależnie od liczby kin i dni.
+        // Jeden film zajmuje jedną pozycję, niezależnie od liczby kin i dni.
+        // Kolejność filmów wynika z ich najbliższego pasującego seansu.
         var films = matching
-            .GroupBy(item => item.Candidate.Screening.MovieId, StringComparer.Ordinal)
+            .GroupBy(
+                item => item.Candidate.Screening.MovieId,
+                StringComparer.Ordinal)
             .ToList();
 
         var take = Math.Clamp(limit, 1, 30);
@@ -231,19 +293,31 @@ public sealed class CinemaTools
         var hasMore = skip + page.Count < films.Count;
 
         var notes = new List<string>
-        {
-            films.Count == 0
-                ? "No upcoming screenings match these filters."
-                : hasMore
-                    ? $"Showing {page.Count} of {films.Count} films. Call again with offset={skip + page.Count} for the rest, " +
-                      "or tell the user there are more."
-                    : "All matching films are listed. Sorted by nearest screening."
-        };
+    {
+        films.Count == 0
+            ? "No upcoming screenings match these filters."
+            : hasMore
+                ? $"Showing {page.Count} of {films.Count} films. " +
+                  $"Call again with offset={skip + page.Count} for the rest, " +
+                  "or tell the user there are more."
+                : "All matching films are listed. Sorted by nearest screening."
+    };
+
         if (hidden.Length > 0)
-            notes.Add($"Hidden by the user's profile (disliked genres): {string.Join(", ", hidden)}. " +
-                      "They are shown only when the user asks for that genre or a specific title.");
+        {
+            notes.Add(
+                $"Hidden by the user's profile (disliked genres): " +
+                $"{string.Join(", ", hidden)}. " +
+                "They are shown only when the user asks for that genre " +
+                "or a specific title.");
+        }
+
         if (effectiveCity is not null)
-            notes.Add($"Only city '{effectiveCity}' was searched; use city='all' to search everywhere.");
+        {
+            notes.Add(
+                $"Only city '{effectiveCity}' was searched; " +
+                "use city='all' to search everywhere.");
+        }
 
         return Result(new
         {
@@ -252,12 +326,17 @@ public sealed class CinemaTools
             totalScreenings = matching.Count,
             shown = page.Count,
             note = string.Join(" ", notes),
+
             films = page.Select(group =>
             {
                 var first = group.First();
+
                 var places = group
-                    .GroupBy(item => (item.Candidate.Schedule.Cinema.Id, item.Candidate.Schedule.Day))
+                    .GroupBy(item => (
+                        item.Candidate.Schedule.Cinema.Id,
+                        item.Candidate.Schedule.Day))
                     .ToList();
+
                 return new
                 {
                     Id = group.Key,
@@ -265,19 +344,35 @@ public sealed class CinemaTools
                     Age = first.Movie.AgeRating,
                     first.Movie.Genres,
                     Minutes = ParseDuration(first.Movie.Duration),
-                    Showings = places.Take(MaxPlacesPerFilm).Select(place => new
-                    {
-                        Cinema = place.First().Candidate.Schedule.Cinema.Name,
-                        Date = place.Key.Day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-                        Times = place.Select(item => item.Candidate.Screening.Format is { Length: > 0 } format
-                            ? $"{item.Candidate.Screening.Time} {format}"
-                            : item.Candidate.Screening.Time).ToList()
-                    }).ToList(),
-                    MoreShowings = places.Count > MaxPlacesPerFilm ? places.Count - MaxPlacesPerFilm : (int?)null
+
+                    Showings = places
+                        .Take(MaxPlacesPerFilm)
+                        .Select(place => new
+                        {
+                            Cinema = place.First()
+                                .Candidate.Schedule.Cinema.Name,
+
+                            Date = place.Key.Day.ToString(
+                                "yyyy-MM-dd",
+                                CultureInfo.InvariantCulture),
+
+                            Times = place.Select(item =>
+                                item.Candidate.Screening.Format
+                                    is { Length: > 0 } screeningFormat
+                                        ? $"{item.Candidate.Screening.Time} {screeningFormat}"
+                                        : item.Candidate.Screening.Time)
+                                .ToList()
+                        })
+                        .ToList(),
+
+                    MoreShowings = places.Count > MaxPlacesPerFilm
+                        ? places.Count - MaxPlacesPerFilm
+                        : (int?)null
                 };
             }).ToList()
         });
     }
+
 
     [Description("Get details of one movie: genres, director, cast, countries, length, age rating. " +
                  "Pass movieId from get_screenings, or a title fragment.")]
@@ -559,6 +654,31 @@ public sealed class CinemaTools
     private static bool MatchesMovie(MovieDocument movie, string? title, string? genre) =>
         Matches(movie.Title, title) && (string.IsNullOrWhiteSpace(genre) ||
             (movie.Genres?.Any(value => Matches(value, genre)) ?? false));
+
+    private static bool MatchesScreeningFormat(
+    string? screeningFormat,
+    string? room,
+    string? requestedFormat)
+    {
+        if (string.IsNullOrWhiteSpace(requestedFormat))
+            return true;
+
+        var tokens = Regex.Split(requestedFormat.Trim(), @"[\s,;+/]+")
+            .Where(token => token.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (tokens.Length == 0)
+            return false;
+
+        // IMAX bywa zapisany w nazwie sali, np. "Sala 1 IMAX".
+        var available = $"{screeningFormat} {room}";
+
+        return tokens.All(token => Regex.IsMatch(
+            available,
+            @"(?<![\p{L}\p{N}])" + Regex.Escape(token) + @"(?![\p{L}\p{N}])",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant));
+    }
 
     private bool IsAllowed(string? rating)
     {
